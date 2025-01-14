@@ -5,6 +5,13 @@ use lsp_types::{Position, Range, *};
 use lsp_server::{Connection, Message, Notification, Response};
 use regex::Regex;
 
+lazy_static::lazy_static! {
+    static ref RANGE1: Regex = Regex::new(r"line (\d+), column (\d+) - (\d+)").unwrap();
+    static ref RANGE2: Regex = Regex::new(r"line (\d+), column (\d+) - line (\d+), column (\d+)").unwrap();
+    static ref RANGE3: Regex = Regex::new(r"line (\d+)").unwrap();
+    static ref COL: Regex = Regex::new(r"\(char (\d+)\)").unwrap();
+}
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(arg) = std::env::args().nth(1) {
         if arg == "--version" {
@@ -69,10 +76,15 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-lazy_static::lazy_static! {
-    static ref RANGE1: Regex = Regex::new(r"line (\d+), column (\d+) - (\d+)").unwrap();
-    static ref RANGE2: Regex = Regex::new(r"line (\d+), column (\d+) - line (\d+), column (\d+)").unwrap();
-    static ref RANGE3: Regex = Regex::new(r"line (\d+)").unwrap();
+fn publish_diagnostics(
+    uri: Uri,
+    diagnostics: Vec<Diagnostic>,
+    connection: &Connection,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let params = PublishDiagnosticsParams { uri, diagnostics, version: None, };
+    let notification = Notification::new("textDocument/publishDiagnostics".to_string(), params);
+    connection.sender.send(Message::Notification(notification))?;
+    Ok(())
 }
 
 fn check_ott_file(
@@ -83,16 +95,13 @@ fn check_ott_file(
     if !Path::new(file_path).is_file() {
         let warning = Diagnostic {
             range: Range::default(),
-            severity: Some(DiagnosticSeverity::WARNING),
+            severity: Some(DiagnosticSeverity::INFORMATION),
             message: format!("file path {file_path} is not a file"),
             ..Default::default()
         };
 
         return publish_diagnostics(uri.clone(), vec![warning], &connection);
     }
-
-    let file_contents = std::fs::read_to_string(file_path)?;
-    let file_lines: Vec<&str> = file_contents.lines().collect();
 
     let output = Command::new("ott")
         .arg("-signal_parse_errors")
@@ -103,20 +112,17 @@ fn check_ott_file(
         .output()?;
 
     let mut diagnostics = Vec::new();
-    if output.status.success() {
-        return publish_diagnostics(uri.clone(), diagnostics, &connection);
-    }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines().peekable();
     while let Some(line) = lines.next() {
         if line.starts_with("File") {
-            // Start of an error block
+            // Start of an error or warning block
             let mut line_start = None;
             let mut line_end = None;
             let mut column_start = None;
             let mut column_end = None;
-            let mut error_msg = Vec::new();
+            let mut message = Vec::new();
+            let mut severity = None;
 
             // Parse line and column numbers using regex
             if let Some(caps) = RANGE1.captures(line) {
@@ -132,37 +138,38 @@ fn check_ott_file(
                 line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
             }
 
-            // Collect all lines until we hit a blank line
+            // Collect message until we hit a blank line or next "File" line
             while let Some(current_line) = lines.peek() {
-                if current_line.is_empty() {
-                    lines.next();  // consume the blank line
+                if current_line.starts_with("File") {
                     break;
                 }
 
-                if current_line.starts_with("Error:") {
-                    // Start collecting error message
-                    if let Some(msg) = current_line.strip_prefix("Error:") {
-                        let trimmed = msg.trim();
-                        if !trimmed.is_empty() {
-                            error_msg.push(trimmed.to_string());
-                        }
+                if let Some(msg) = current_line.strip_prefix("Error:") {
+                    severity = Some(DiagnosticSeverity::ERROR);
+                    let trimmed = msg.trim();
+                    if !trimmed.is_empty() {
+                        message.push(trimmed);
                     }
-                } else if current_line.contains("char") {
-                    // Parse column from "char" format if we don't already have it
+                } else if let Some(msg) = current_line.strip_prefix("Warning:") {
+                    severity = Some(DiagnosticSeverity::WARNING);
+                    let trimmed = msg.trim();
+                    if !trimmed.is_empty() {
+                        message.push(trimmed);
+                    }
+                } else if let Some(caps) = COL.captures(current_line) {
                     if column_start.is_none() {
-                        if let Some(char_pos) = current_line.split("char ").nth(1) {
-                            if let Some(col) = char_pos.split("):").next() {
-                                column_start = col.trim().parse::<u32>().ok();
-                            }
-                        }
+                        column_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
                     }
-                } else if !current_line.starts_with("File") {
-                    // Collect additional error message lines
-                    error_msg.push(current_line.trim().to_string());
+                } else if !current_line.starts_with("Definition rule") {
+                    message.push(current_line.trim());
                 }
 
                 lines.next();
             }
+
+            let message = message.is_empty()
+                .then(|| "unknown ott diagnostic message".into())
+                .unwrap_or(message.join(" "));
 
             // Create diagnostic range
             let line_start = line_start.map(|l| l - 1).unwrap_or(0);
@@ -172,36 +179,22 @@ fn check_ott_file(
                     Position::new(line_start, col_start),
                     Position::new(line_end, col_end),
                 ),
-                (Some(col), None) => {
-                    let line_length = file_lines.get(line_end as usize)
-                        .map(|line| line.len() as u32)
-                        .unwrap_or(col);
-
-                    Range::new(
-                        Position::new(line_start, col),
-                        Position::new(line_end, line_length),
-                    )
-                },
+                (Some(col), None) => Range::new(
+                    Position::new(line_start, col),
+                    Position::new(line_end, col + message.len() as u32),
+                ),
                 (None, _) => Range::new(
                     Position::new(line_start, 0),
                     Position::new(line_end, 0),
                 ),
             };
 
-            diagnostics.push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: match &*error_msg {
-                    &[] => "unknown ott error".to_string(),
-                    _ => error_msg.join(" ")
-                },
-                ..Default::default()
-            });
+            diagnostics.push(Diagnostic { range, severity, message, ..Default::default() });
         }
     }
 
-    // If we found no specific errors but the command failed, emit a general error
-    if diagnostics.is_empty() {
+    // emit a general error if no specific errors/warnings were found
+    if diagnostics.is_empty() && !output.status.success() {
         diagnostics.push(Diagnostic {
             range: Range::default(),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -211,15 +204,4 @@ fn check_ott_file(
     }
 
     publish_diagnostics(uri.clone(), diagnostics, &connection)
-}
-
-fn publish_diagnostics(
-    uri: Uri,
-    diagnostics: Vec<Diagnostic>,
-    connection: &Connection,
-) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let params = PublishDiagnosticsParams { uri, diagnostics, version: None, };
-    let notification = Notification::new("textDocument/publishDiagnostics".to_string(), params);
-    connection.sender.send(Message::Notification(notification))?;
-    Ok(())
 }
