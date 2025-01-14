@@ -13,10 +13,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
-    // Create the transport
+    // Create the transport, run the server
     let (connection, io_threads) = Connection::stdio();
-
-    // Run the server
     let server_capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
             open_close: Some(true),
@@ -35,6 +33,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
+
                 match req.method.as_str() {
                     "textDocument/documentSymbol" => {
                         let resp = Response {
@@ -103,117 +102,112 @@ fn check_ott_file(
         .arg(file_path)
         .output()?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut diagnostics = Vec::new();
+    if output.status.success() {
+        return publish_diagnostics(uri.clone(), diagnostics, &connection);
+    }
 
-    if !output.status.success() {
-        let mut lines = stdout.lines().peekable();
-        while let Some(line) = lines.next() {
-            if line.starts_with("File") {
-                // Start of an error block
-                let mut line_start = None;
-                let mut line_end = None;
-                let mut column_start = None;
-                let mut column_end = None;
-                let mut error_msg = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with("File") {
+            // Start of an error block
+            let mut line_start = None;
+            let mut line_end = None;
+            let mut column_start = None;
+            let mut column_end = None;
+            let mut error_msg = Vec::new();
 
-                // Parse line and column numbers using regex
-                if let Some(caps) = RANGE1.captures(line) {
-                    line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
-                    column_start = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-                    column_end = caps.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
-                } else if let Some(caps) = RANGE2.captures(line) {
-                    line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
-                    column_start = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
-                    line_end = caps.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
-                    column_end = caps.get(4).and_then(|m| m.as_str().parse::<u32>().ok());
-                } else if let Some(caps) = RANGE3.captures(line) {
-                    line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+            // Parse line and column numbers using regex
+            if let Some(caps) = RANGE1.captures(line) {
+                line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+                column_start = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+                column_end = caps.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
+            } else if let Some(caps) = RANGE2.captures(line) {
+                line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+                column_start = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
+                line_end = caps.get(3).and_then(|m| m.as_str().parse::<u32>().ok());
+                column_end = caps.get(4).and_then(|m| m.as_str().parse::<u32>().ok());
+            } else if let Some(caps) = RANGE3.captures(line) {
+                line_start = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
+            }
+
+            // Collect all lines until we hit a blank line
+            while let Some(current_line) = lines.peek() {
+                if current_line.is_empty() {
+                    lines.next();  // consume the blank line
+                    break;
                 }
 
-                // Collect all lines until we hit a blank line
-                while let Some(current_line) = lines.peek() {
-                    if current_line.is_empty() {
-                        lines.next();  // consume the blank line
-                        break;
+                if current_line.starts_with("Error:") {
+                    // Start collecting error message
+                    if let Some(msg) = current_line.strip_prefix("Error:") {
+                        let trimmed = msg.trim();
+                        if !trimmed.is_empty() {
+                            error_msg.push(trimmed.to_string());
+                        }
                     }
-
-                    if current_line.starts_with("Error:") {
-                        // Start collecting error message
-                        if let Some(msg) = current_line.strip_prefix("Error:") {
-                            let trimmed = msg.trim();
-                            if !trimmed.is_empty() {
-                                error_msg.push(trimmed.to_string());
+                } else if current_line.contains("char") {
+                    // Parse column from "char" format if we don't already have it
+                    if column_start.is_none() {
+                        if let Some(char_pos) = current_line.split("char ").nth(1) {
+                            if let Some(col) = char_pos.split("):").next() {
+                                column_start = col.trim().parse::<u32>().ok();
                             }
                         }
-                    } else if current_line.contains("char") {
-                        // Parse column from "char" format if we don't already have it
-                        if column_start.is_none() {
-                            if let Some(char_pos) = current_line.split("char ").nth(1) {
-                                if let Some(col) = char_pos.split("):").next() {
-                                    column_start = col.trim().parse::<u32>().ok();
-                                }
-                            }
-                        }
-                    } else if !current_line.starts_with("File") {
-                        // Collect additional error message lines
-                        error_msg.push(current_line.trim().to_string());
                     }
-
-                    lines.next();
+                } else if !current_line.starts_with("File") {
+                    // Collect additional error message lines
+                    error_msg.push(current_line.trim().to_string());
                 }
 
-                let line_start = line_start.map(|l| l - 1).unwrap_or(0);
-                let line_end = line_end.map(|l| l - 1).unwrap_or(line_start);
+                lines.next();
+            }
 
-                // Create diagnostic range
-                let range = match (column_start, column_end) {
-                    (Some(col_start), Some(col_end)) => Range::new(
-                        Position::new(line_start, col_start),
-                        Position::new(line_end, col_end),
-                    ),
-                    (Some(col), None) => {
-                        let line_idx = line_end as usize;
-                        let line_length = if line_idx < file_lines.len() {
-                            file_lines[line_idx].len()
-                        } else {
-                            col as usize + 1
-                        };
-                        Range::new(
-                            Position::new(line_start, col),
-                            Position::new(line_end, line_length as u32),
-                        )
-                    },
-                    (None, _) => Range::new(
-                        Position::new(line_start, 0),
-                        Position::new(line_end, 0),
-                    ),
-                };
+            // Create diagnostic range
+            let line_start = line_start.map(|l| l - 1).unwrap_or(0);
+            let line_end = line_end.map(|l| l - 1).unwrap_or(line_start);
+            let range = match (column_start, column_end) {
+                (Some(col_start), Some(col_end)) => Range::new(
+                    Position::new(line_start, col_start),
+                    Position::new(line_end, col_end),
+                ),
+                (Some(col), None) => {
+                    let line_length = file_lines.get(line_end as usize)
+                        .map(|line| line.len() as u32)
+                        .unwrap_or(col);
 
-                // Join multi-line error messages
-                let error_message = match &*error_msg {
+                    Range::new(
+                        Position::new(line_start, col),
+                        Position::new(line_end, line_length),
+                    )
+                },
+                (None, _) => Range::new(
+                    Position::new(line_start, 0),
+                    Position::new(line_end, 0),
+                ),
+            };
+
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: match &*error_msg {
                     &[] => "unknown ott error".to_string(),
                     _ => error_msg.join(" ")
-                };
-
-                diagnostics.push(Diagnostic {
-                    range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: error_message,
-                    ..Default::default()
-                });
-            }
-        }
-
-        // If we found no specific errors but the command failed, emit a general error
-        if diagnostics.is_empty() {
-            diagnostics.push(Diagnostic {
-                range: Range::default(),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: "ott processing failed".to_string(),
+                },
                 ..Default::default()
             });
         }
+    }
+
+    // If we found no specific errors but the command failed, emit a general error
+    if diagnostics.is_empty() {
+        diagnostics.push(Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "ott processing failed".to_string(),
+            ..Default::default()
+        });
     }
 
     publish_diagnostics(uri.clone(), diagnostics, &connection)
