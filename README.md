@@ -15,6 +15,10 @@ configs.ott_lsp = {
             return vim.fn.getcwd()
         end,
         single_file_support = true,
+        settings = {
+            -- pass additional flags to ott command
+            ottFlags = { "-additional", "ott_flags", "true" }
+        }
     },
 }
 

@@ -1,15 +1,25 @@
-use std::{error::Error, path::Path};
+use std::path::Path;
+use std::error::Error;
 use std::process::Command;
 
-use lsp_types::{Position, Range, *};
-use lsp_server::{Connection, Message, Notification, Response};
+use parking_lot::RwLock;
+use serde_json::from_value;
+use serde::Deserialize;
 use regex::Regex;
+use lsp_server::{Connection, Message, Notification, Response};
+use lsp_types::*;
 
 lazy_static::lazy_static! {
     static ref RANGE1: Regex = Regex::new(r"line (\d+), column (\d+) - (\d+)").unwrap();
     static ref RANGE2: Regex = Regex::new(r"line (\d+), column (\d+) - line (\d+), column (\d+)").unwrap();
     static ref RANGE3: Regex = Regex::new(r"line (\d+)").unwrap();
     static ref COL: Regex = Regex::new(r"\(char (\d+)\)").unwrap();
+}
+
+#[derive(Default, Debug, Deserialize)]
+struct Config {
+    #[serde(default, alias = "ottFlags")]
+    ott_flags: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -30,10 +40,16 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             ..Default::default()
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: None,
+            file_operations: None,
+        }),
         ..Default::default()
     })?;
 
+    let config = RwLock::new(Config::default());
     connection.initialize(server_capabilities)?;
+
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -43,12 +59,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 match req.method.as_str() {
                     "textDocument/documentSymbol" => {
-                        let resp = Response {
+                        connection.sender.send(Message::Response( Response {
                             id: req.id,
                             result: Some(serde_json::Value::Array(vec![])),
                             error: None,
-                        };
-                        connection.sender.send(Message::Response(resp))?;
+                        }))?;
                     }
                     _ => {}
                 }
@@ -56,15 +71,21 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Message::Response(_resp) => {}
             Message::Notification(not) => {
                 match not.method.as_str() {
+                    "workspace/didChangeConfiguration" => {
+                        let params: DidChangeConfigurationParams = from_value(not.params)?;
+                        if let Ok(new_config) = serde_json::from_value(params.settings) {
+                            *config.write() = new_config;
+                        }
+                    }
                     "textDocument/didOpen" => {
-                        let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
-                        let file_path = params.text_document.uri.path();
-                        check_ott_file(file_path.as_str(), &params.text_document.uri, &connection)?;
+                        let params: DidOpenTextDocumentParams = from_value(not.params)?;
+                        let uri = &params.text_document.uri;
+                        check_ott_file(&*config.read(), uri.path().as_str(), uri, &connection)?;
                     }
                     "textDocument/didSave" => {
-                        let params: DidSaveTextDocumentParams = serde_json::from_value(not.params)?;
-                        let file_path = params.text_document.uri.path();
-                        check_ott_file(file_path.as_str(), &params.text_document.uri, &connection)?;
+                        let params: DidSaveTextDocumentParams = from_value(not.params)?;
+                        let uri = &params.text_document.uri;
+                        check_ott_file(&*config.read(), uri.path().as_str(), uri, &connection)?;
                     }
                     _ => {}
                 }
@@ -88,6 +109,7 @@ fn publish_diagnostics(
 }
 
 fn check_ott_file(
+    config: &Config,
     file_path: &str,
     uri: &Uri,
     connection: &Connection,
@@ -108,6 +130,7 @@ fn check_ott_file(
         .arg("true")
         .arg("-colour")
         .arg("false")
+        .args(&config.ott_flags)
         .arg(file_path)
         .output()?;
 
